@@ -2,6 +2,7 @@
 
 import abc
 import enum
+import os
 from litellm import completion
 
 from typing import Optional, List, Dict, Any, Union
@@ -115,9 +116,11 @@ User Response:
 <the user response (this will be parsed and sent to the agent)>"""
 
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
-        res = completion(
-            model=self.model, custom_llm_provider=self.provider, messages=messages
-        )
+        api_base = os.getenv("USER_MODEL_API_BASE")
+        kwargs = {"model": self.model, "custom_llm_provider": self.provider, "messages": messages}
+        if api_base:
+            kwargs["api_base"] = api_base
+        res = completion(**kwargs)
         message = res.choices[0].message
         self.messages.append(message.model_dump())
         self.total_cost = res._hidden_params["response_cost"]
@@ -163,10 +166,12 @@ class VerifyUserSimulationEnv(LLMUserSimulationEnv):
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
         attempts = 0
         cur_message = None
+        api_base = os.getenv("USER_MODEL_API_BASE")
         while attempts < self.max_attempts:
-            res = completion(
-                model=self.model, custom_llm_provider=self.provider, messages=messages
-            )
+            kwargs = {"model": self.model, "custom_llm_provider": self.provider, "messages": messages}
+            if api_base:
+                kwargs["api_base"] = api_base
+            res = completion(**kwargs)
             cur_message = res.choices[0].message
             self.total_cost = res._hidden_params["response_cost"]
             if verify(self.model, self.provider, cur_message, messages):
@@ -224,11 +229,15 @@ Your answer will be parsed, so do not include any other text than the classifica
 -----
 
 Classification:"""
-    res = completion(
-        model=model,
-        custom_llm_provider=provider,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    api_base = os.getenv("USER_MODEL_API_BASE")
+    kwargs = {
+        "model": model,
+        "custom_llm_provider": provider,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if api_base:
+        kwargs["api_base"] = api_base
+    res = completion(**kwargs)
     return "true" in res.choices[0].message.content.lower()
 
 
@@ -258,11 +267,15 @@ Reflection:
 
 Response:
 <the response (this will be parsed and sent to the agent)>"""
-    res = completion(
-        model=model,
-        custom_llm_provider=provider,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    api_base = os.getenv("USER_MODEL_API_BASE")
+    kwargs = {
+        "model": model,
+        "custom_llm_provider": provider,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if api_base:
+        kwargs["api_base"] = api_base
+    res = completion(**kwargs)
     _, response = res.choices[0].message.content.split("Response:")
     return response.strip()
 
