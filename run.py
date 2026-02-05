@@ -1,6 +1,7 @@
 # Copyright Sierra
 
 import argparse
+from datetime import datetime
 from tau_bench.types import RunConfig
 from tau_bench.run import run
 from litellm import provider_list
@@ -94,8 +95,12 @@ def parse_args() -> RunConfig:
 
 
 def main():
+    print("Starting tau-bench")
+    print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     config = parse_args()
     run(config)
+    print("Finished running tau-bench")
+    print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 
 if __name__ == "__main__":
