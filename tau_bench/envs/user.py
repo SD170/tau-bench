@@ -45,9 +45,11 @@ class LLMUserSimulationEnv(BaseUserSimulationEnv):
         self.reset()
 
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
-        res = completion(
-            model=self.model, custom_llm_provider=self.provider, messages=messages
-        )
+        api_base = os.getenv("USER_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
+        kwargs = {"model": self.model, "custom_llm_provider": self.provider, "messages": messages}
+        if api_base:
+            kwargs["api_base"] = api_base
+        res = completion(**kwargs)
         message = res.choices[0].message
         self.messages.append(message.model_dump())
         self.total_cost = res._hidden_params["response_cost"]
@@ -116,7 +118,7 @@ User Response:
 <the user response (this will be parsed and sent to the agent)>"""
 
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
-        api_base = os.getenv("USER_MODEL_API_BASE")
+        api_base = os.getenv("USER_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
         kwargs = {"model": self.model, "custom_llm_provider": self.provider, "messages": messages}
         if api_base:
             kwargs["api_base"] = api_base
@@ -166,7 +168,7 @@ class VerifyUserSimulationEnv(LLMUserSimulationEnv):
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
         attempts = 0
         cur_message = None
-        api_base = os.getenv("USER_MODEL_API_BASE")
+        api_base = os.getenv("USER_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
         while attempts < self.max_attempts:
             kwargs = {"model": self.model, "custom_llm_provider": self.provider, "messages": messages}
             if api_base:
@@ -229,7 +231,7 @@ Your answer will be parsed, so do not include any other text than the classifica
 -----
 
 Classification:"""
-    api_base = os.getenv("USER_MODEL_API_BASE")
+    api_base = os.getenv("USER_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
     kwargs = {
         "model": model,
         "custom_llm_provider": provider,
@@ -267,7 +269,7 @@ Reflection:
 
 Response:
 <the response (this will be parsed and sent to the agent)>"""
-    api_base = os.getenv("USER_MODEL_API_BASE")
+    api_base = os.getenv("USER_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
     kwargs = {
         "model": model,
         "custom_llm_provider": provider,
