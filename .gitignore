@@ -8,3 +8,5 @@ __pycache__/
 
 # Custom scripts
 custom-scripts/
+
+.env

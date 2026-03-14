@@ -1,6 +1,7 @@
 # Copyright Sierra
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,7 +18,7 @@ from tau_bench.types import (
 )
 
 MAX_CRITIC_RETRIES = 2
-READ_ONLY_PREFIXES = ("get_", "find_", "list_", "search_", "calculate", "think")
+READ_ONLY_PREFIXES = ("get_", "list_", "calculate", "think")
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,14 @@ class Plan:
 
 
 @dataclass
+class CompletedToolCall:
+    name: str
+    kwargs: Dict[str, Any]
+    result_summary: str
+    full_result: str = ""
+
+
+@dataclass
 class ConversationState:
     executor_messages: List[Dict[str, Any]] = field(default_factory=list)
     approved_plan: Optional[Plan] = None
@@ -69,6 +78,8 @@ class ConversationState:
     internal_trace: List[Dict[str, Any]] = field(default_factory=list)
     info: Dict[str, Any] = field(default_factory=dict)
     reward: float = 0.0
+    completed_tool_calls: List[CompletedToolCall] = field(default_factory=list)
+    original_user_request: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +124,10 @@ Rules:
 - If there is no existing plan, create one and use "continue_existing_plan".
 - If the user's latest message materially changes the goal, constraints, or approach, \
 use "propose_plan_change" and set "confirmation_question" to ask for confirmation.
+- IMPORTANT: Reducing the scope of the plan (e.g. dropping items the user originally \
+asked about, handling fewer requests than originally stated) is a MATERIAL plan change \
+that requires "propose_plan_change" with user confirmation. Never silently drop user \
+requests from the plan.
 - If you just need to progress through existing steps, use "continue_existing_plan" and \
 update step statuses accordingly.
 - Step status updates (pending -> in_progress -> done) do NOT require user confirmation.
@@ -123,6 +138,8 @@ with the original plan unchanged.
 - If you need more information to proceed, use "request_clarification" and set \
 "confirmation_question" to your question.
 - The "plan" field must ALWAYS be present.
+- When the user mentions a fallback preference (e.g. "if X isn't available, I'll take Y"), \
+include that fallback in the plan steps so it is not lost.
 """
 
 EXECUTOR_SYSTEM_TEMPLATE = """{wiki}
@@ -133,20 +150,39 @@ EXECUTOR_SYSTEM_TEMPLATE = """{wiki}
 # Active Step
 {active_step}
 
-Execute the active step of the plan using the available tools. Follow the domain policy strictly.
-If you have enough information to respond to the user, respond directly.
-If you need to gather information or perform an action, use the appropriate tool."""
+# Tool Calls Already Completed
+{completed_tools}
+
+CRITICAL RULES:
+- NEVER fabricate or guess user data (emails, names, IDs, addresses, order numbers). \
+Only use information the user has explicitly provided in the conversation or that was \
+returned by a previous tool call.
+- If you need information the user hasn't provided, ASK them for it instead of guessing.
+- Do not repeat tool calls that have already been completed (see above).
+- Execute the active step of the plan using the available tools.
+- Follow the domain policy strictly.
+- If you have enough information to respond to the user, respond directly.
+- If you need to gather information or perform an action, use the appropriate tool."""
 
 CRITIC_INSTRUCTION = """You are an evaluation agent for a customer service system.
 
 # Domain Policy
 {wiki}
 
+# Original User Request
+{original_request}
+
 # Current Plan
 {plan_summary}
 
 # Active Step
 {active_step}
+
+# Tool Calls Already Completed (these are FACTS, do not ask to redo them)
+{completed_tools}
+
+# Actual Tool Output Data (raw results from completed tool calls)
+{tool_output_data}
 
 # Proposed Action
 Tool: {action_name}
@@ -161,6 +197,20 @@ Evaluate whether the proposed action is appropriate. Consider:
 2. Does the action follow the domain policy?
 3. Is the action safe and correct (right arguments, right tool)?
 4. If this is a response to the user, is it accurate and complete?
+5. Does the action still serve the user's ORIGINAL request? If the plan has narrowed \
+scope (e.g. handling fewer items than originally requested), reject and flag it.
+6. IMPORTANT: If a tool call uses arguments (names, emails, IDs, etc.) that the user \
+never provided in the conversation, reject it as hallucinated data.
+
+CRITICAL RULES:
+- If a tool call has ALREADY been completed (see "Tool Calls Already Completed"), \
+do NOT reject an action just because you think that step hasn't happened yet. \
+Trust the completed tool call records as ground truth.
+- Do NOT make factual claims about product availability, pricing, or data unless \
+you can verify it from the "Actual Tool Output Data" above. If you don't have data \
+to confirm or deny something, APPROVE the action and let the tool call resolve it.
+- When in doubt about factual data, APPROVE. Only reject when you have concrete \
+evidence from the tool outputs or conversation that the action is wrong.
 
 You MUST respond with ONLY valid JSON (no markdown, no extra text):
 {{
@@ -282,6 +332,39 @@ class MultiAgentV1(Agent):
                 lines.append(f"[User] {(msg.get('content') or '')[:300]}")
         return "\n".join(lines) if lines else "No conversation yet."
 
+    @staticmethod
+    def _format_completed_tools(
+        completed: List[CompletedToolCall],
+    ) -> str:
+        if not completed:
+            return "None yet."
+        lines: List[str] = []
+        for tc in completed:
+            args_str = json.dumps(tc.kwargs)[:150]
+            lines.append(f"- {tc.name}({args_str}) → {tc.result_summary}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_tool_output_data(
+        completed: List[CompletedToolCall],
+        max_per_tool: int = 1500,
+        max_total: int = 6000,
+    ) -> str:
+        """Full tool results for the critic to make factual decisions."""
+        if not completed:
+            return "No tool data available yet."
+        lines: List[str] = []
+        total = 0
+        for tc in completed:
+            result_text = tc.full_result[:max_per_tool]
+            entry = f"## {tc.name}({json.dumps(tc.kwargs)[:200]})\n{result_text}"
+            if total + len(entry) > max_total:
+                lines.append("... (earlier tool outputs truncated for space)")
+                break
+            lines.append(entry)
+            total += len(entry)
+        return "\n\n".join(lines)
+
     # ---- LLM role callers ----
 
     def _call_planner(self, state: ConversationState) -> Dict[str, Any]:
@@ -306,11 +389,15 @@ class MultiAgentV1(Agent):
                 "content": "Analyze the conversation and return your planning decision as JSON.",
             },
         ]
+        api_base = os.getenv("AGENT_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
+        api_key = os.getenv("AGENT_MODEL_API_KEY") or os.getenv("OPENAI_API_KEY")
         res = completion(
             model=self.planner_model,
             custom_llm_provider=self.planner_provider,
             messages=messages,
             temperature=self.temperature,
+            api_base=api_base,
+            api_key=api_key,
         )
         cost = res._hidden_params.get("response_cost", 0) or 0
         state.total_cost += cost
@@ -346,6 +433,7 @@ class MultiAgentV1(Agent):
             active_step=self._get_active_step_description(
                 state.approved_plan, state.active_step_id
             ),
+            completed_tools=self._format_completed_tools(state.completed_tool_calls),
         )
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt}
@@ -354,12 +442,16 @@ class MultiAgentV1(Agent):
         if extra_messages:
             messages.extend(extra_messages)
 
+        api_base = os.getenv("AGENT_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
+        api_key = os.getenv("AGENT_MODEL_API_KEY") or os.getenv("OPENAI_API_KEY")
         res = completion(
             model=self.model,
             custom_llm_provider=self.provider,
             messages=messages,
             tools=self.tools_info,
             temperature=self.temperature,
+            api_base=api_base,
+            api_key=api_key,
         )
         cost = res._hidden_params.get("response_cost", 0) or 0
         msg = res.choices[0].message.model_dump()
@@ -377,12 +469,19 @@ class MultiAgentV1(Agent):
     def _call_critic(
         self, state: ConversationState, action: Action
     ) -> Dict[str, Any]:
-        recent = state.executor_messages[-6:]
+        recent = state.executor_messages[-16:]
         prompt = CRITIC_INSTRUCTION.format(
             wiki=self.wiki,
+            original_request=state.original_user_request[:500],
             plan_summary=self._format_plan(state.approved_plan),
             active_step=self._get_active_step_description(
                 state.approved_plan, state.active_step_id
+            ),
+            completed_tools=self._format_completed_tools(
+                state.completed_tool_calls
+            ),
+            tool_output_data=self._format_tool_output_data(
+                state.completed_tool_calls
             ),
             action_name=action.name,
             action_args=json.dumps(action.kwargs, indent=2),
@@ -395,11 +494,15 @@ class MultiAgentV1(Agent):
                 "content": "Evaluate the proposed action and return your assessment as JSON.",
             },
         ]
+        api_base = os.getenv("AGENT_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
+        api_key = os.getenv("AGENT_MODEL_API_KEY") or os.getenv("OPENAI_API_KEY")
         res = completion(
             model=self.critic_model,
             custom_llm_provider=self.critic_provider,
             messages=messages,
             temperature=self.temperature,
+            api_base=api_base,
+            api_key=api_key,
         )
         cost = res._hidden_params.get("response_cost", 0) or 0
         state.total_cost += cost
@@ -469,6 +572,7 @@ class MultiAgentV1(Agent):
             {"role": "system", "content": self.wiki},
             {"role": "user", "content": reset_resp.observation},
         ]
+        state.original_user_request = reset_resp.observation
 
         last_source = "user"
 
@@ -591,6 +695,14 @@ class MultiAgentV1(Agent):
             state.info = {**state.info, **env_resp.info.model_dump()}
 
             if action.name != RESPOND_ACTION_NAME:
+                state.completed_tool_calls.append(
+                    CompletedToolCall(
+                        name=action.name,
+                        kwargs=action.kwargs,
+                        result_summary=(env_resp.observation or "")[:200],
+                        full_result=env_resp.observation or "",
+                    )
+                )
                 if executor_msg.get("tool_calls"):
                     executor_msg["tool_calls"] = executor_msg["tool_calls"][:1]
                     state.executor_messages.extend(
