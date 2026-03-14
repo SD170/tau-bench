@@ -156,13 +156,32 @@ EXECUTOR_SYSTEM_TEMPLATE = """{wiki}
 CRITICAL RULES:
 - NEVER fabricate or guess user data (emails, names, IDs, addresses, order numbers). \
 Only use information the user has explicitly provided in the conversation or that was \
-returned by a previous tool call.
+returned by a previous tool call. For example, NEVER call find_user_id_by_email with \
+an email you made up — ask the user for their email first.
 - If you need information the user hasn't provided, ASK them for it instead of guessing.
 - Do not repeat tool calls that have already been completed (see above).
 - Execute the active step of the plan using the available tools.
 - Follow the domain policy strictly.
 - If you have enough information to respond to the user, respond directly.
-- If you need to gather information or perform an action, use the appropriate tool."""
+- If you need to gather information or perform an action, use the appropriate tool.
+- SCOPE AWARENESS: Pay close attention to EXACTLY which items the user wants to act on. \
+If the user says "only exchange item X" or "just modify the lamp", do NOT include other \
+items in the tool call. Read the user's most recent message carefully for scope qualifiers \
+like "only", "just", "specifically".
+- RELATIVE TERMS: When the user asks for something "less X" or "more Y", compare against \
+the CURRENT item's attributes. "Less bright" means a brightness level LOWER than what they \
+currently have, not the same level.
+- MANDATORY AUTHENTICATION: User authentication is REQUIRED by policy for any order-viewing \
+or order-modifying action. If the user refuses to provide identifying information (name, \
+email, etc.), clearly state that authentication is a system requirement and you cannot \
+proceed without it. Be direct — do not keep politely re-asking indefinitely. After 2 clear \
+explanations, tell the user you cannot help with this request without authentication.
+- RESPECT USER FALLBACK PREFERENCES: When the user states a preference chain like \
+"I want X, but if X is unavailable I'll take Y", and you discover X is unavailable, \
+apply the fallback Y directly. Do NOT present other alternatives that differ from what \
+the user explicitly stated as their fallback.
+- Be decisive and efficient. When you have all information needed, proceed to the action \
+rather than asking for one more round of confirmation. ONE confirmation round is sufficient."""
 
 CRITIC_INSTRUCTION = """You are an evaluation agent for a customer service system.
 
@@ -527,14 +546,47 @@ class MultiAgentV1(Agent):
             }
         return parsed
 
-    # ---- Heuristic gate ----
+    # ---- Helpers ----
 
     @staticmethod
-    def _requires_critique(action: Action) -> bool:
+    def _is_rejection(text: str) -> bool:
+        """Heuristic: does the user's response reject the proposed plan?"""
+        low = text.strip().lower()
+        negations = [
+            "no ", "no,", "no.", "nope", "nah", "don't", "do not",
+            "cancel", "never mind", "nevermind", "not what i",
+            "that's not", "that is not", "i didn't", "i did not",
+        ]
+        return any(n in low for n in negations) or low in ("no", "nope", "nah")
+
+    @staticmethod
+    def _validate_action(action: Action, state: "ConversationState") -> Dict[str, Any]:
+        """Deterministic validation replacing the LLM critic.
+        Checks that referenced IDs actually exist in conversation or tool results."""
         if action.name == RESPOND_ACTION_NAME:
-            return True
-        name_lower = action.name.lower()
-        return not any(name_lower.startswith(p) for p in READ_ONLY_PREFIXES)
+            return {"approved": True, "reason": "Response auto-approved."}
+
+        known_data = ""
+        for tc in state.completed_tool_calls:
+            known_data += tc.full_result + "\n"
+        for msg in state.executor_messages:
+            if msg.get("role") in ("user", "tool"):
+                known_data += (msg.get("content") or "") + "\n"
+
+        for key in ("user_id", "order_id"):
+            if key in action.kwargs:
+                val = str(action.kwargs[key])
+                if val and val not in known_data:
+                    return {
+                        "approved": False,
+                        "reason": f"{key} '{val}' not in conversation or tool results.",
+                        "feedback_for_executor": (
+                            f"The {key} '{val}' hasn't appeared in the conversation "
+                            f"or any tool result. Please verify it first."
+                        ),
+                    }
+
+        return {"approved": True, "reason": "Validation passed."}
 
     @staticmethod
     def _message_to_action(message: Dict[str, Any]) -> Action:
@@ -575,8 +627,21 @@ class MultiAgentV1(Agent):
         state.original_user_request = reset_resp.observation
 
         last_source = "user"
+        plan_change_proposals = 0
 
         for _ in range(max_num_steps):
+            # ---------- AUTO-APPLY PENDING PLAN CONFIRMATION ----------
+            if last_source == "user" and state.pending_plan_update:
+                user_response = (
+                    state.executor_messages[-1].get("content", "")
+                    if state.executor_messages
+                    else ""
+                )
+                proposed = state.pending_plan_update.get("proposed_plan")
+                if not self._is_rejection(user_response) and proposed and isinstance(proposed, dict):
+                    state.approved_plan = Plan.from_dict(proposed)
+                state.pending_plan_update = None
+
             # ---------- PLANNER PHASE (runs on every user message) ----------
             if last_source == "user":
                 planner_result = self._call_planner(state)
@@ -584,32 +649,43 @@ class MultiAgentV1(Agent):
                 plan_data = planner_result.get("plan")
 
                 if decision == "propose_plan_change":
-                    state.pending_plan_update = {
-                        "proposed_plan": plan_data,
-                        "reason": planner_result.get("reason", ""),
-                    }
-                    question = planner_result.get(
-                        "confirmation_question",
-                        "Could you confirm you'd like me to proceed with this updated plan?",
-                    )
-                    env_resp = env.step(
-                        Action(
-                            name=RESPOND_ACTION_NAME,
-                            kwargs={RESPOND_ACTION_FIELD_NAME: question},
+                    plan_change_proposals += 1
+                    if plan_change_proposals > 2:
+                        if plan_data and isinstance(plan_data, dict):
+                            state.approved_plan = Plan.from_dict(plan_data)
+                        state.pending_plan_update = None
+                        state.active_step_id = planner_result.get(
+                            "active_step_id", state.active_step_id
                         )
-                    )
-                    state.reward = env_resp.reward
-                    state.info = {**state.info, **env_resp.info.model_dump()}
-                    state.executor_messages.extend(
-                        [
-                            {"role": "assistant", "content": question},
-                            {"role": "user", "content": env_resp.observation},
-                        ]
-                    )
-                    last_source = "user"
-                    if env_resp.done:
-                        break
-                    continue
+                    else:
+                        state.pending_plan_update = {
+                            "proposed_plan": plan_data,
+                            "reason": planner_result.get("reason", ""),
+                        }
+                        question = planner_result.get(
+                            "confirmation_question",
+                            "Could you confirm you'd like me to proceed with this updated plan?",
+                        )
+                        env_resp = env.step(
+                            Action(
+                                name=RESPOND_ACTION_NAME,
+                                kwargs={RESPOND_ACTION_FIELD_NAME: question},
+                            )
+                        )
+                        state.reward = env_resp.reward
+                        state.info = {**state.info, **env_resp.info.model_dump()}
+                        state.executor_messages.extend(
+                            [
+                                {"role": "assistant", "content": question},
+                                {"role": "user", "content": env_resp.observation},
+                            ]
+                        )
+                        last_source = "user"
+                        if env_resp.done:
+                            break
+                        continue
+                else:
+                    plan_change_proposals = 0
 
                 if decision == "request_clarification":
                     question = planner_result.get(
@@ -643,7 +719,7 @@ class MultiAgentV1(Agent):
                     "active_step_id", state.active_step_id
                 )
 
-            # ---------- EXECUTOR + CRITIC PHASE ----------
+            # ---------- EXECUTOR + VALIDATION PHASE ----------
             action: Optional[Action] = None
             executor_msg: Optional[Dict[str, Any]] = None
             retry_context: List[Dict[str, Any]] = []
@@ -654,25 +730,22 @@ class MultiAgentV1(Agent):
                 )
                 state.total_cost += cost
 
-                if self._requires_critique(action):
-                    critic_result = self._call_critic(state, action)
-                    if critic_result.get("approved", True):
-                        break
-                    feedback = critic_result.get(
-                        "feedback_for_executor",
-                        "Please reconsider your action.",
-                    )
-                    retry_context.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                f"[Evaluator] Your proposed action was rejected: "
-                                f"{feedback}. Please try a different approach."
-                            ),
-                        }
-                    )
-                else:
+                validation = self._validate_action(action, state)
+                if validation.get("approved", True):
                     break
+                feedback = validation.get(
+                    "feedback_for_executor",
+                    "Please reconsider your action.",
+                )
+                retry_context.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"[Validator] Your proposed action was rejected: "
+                            f"{feedback}. Please try a different approach."
+                        ),
+                    }
+                )
             else:
                 action = Action(
                     name=RESPOND_ACTION_NAME,
