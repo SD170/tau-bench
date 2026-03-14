@@ -88,3 +88,9 @@ class RunConfig(BaseModel):
     shuffle: int = 0
     user_strategy: str = "llm"
     few_shot_displays_path: Optional[str] = None
+    # multi-agent-v1 knobs (default to main model/provider when None)
+    planner_model: Optional[str] = None
+    planner_provider: Optional[str] = None
+    critic_model: Optional[str] = None
+    critic_provider: Optional[str] = None
+    max_critic_retries: int = 2
