@@ -46,10 +46,12 @@ class LLMUserSimulationEnv(BaseUserSimulationEnv):
 
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
         api_base = os.getenv("USER_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
-        kwargs = {"model": self.model, "custom_llm_provider": self.provider, "messages": messages}
-        if api_base:
-            kwargs["api_base"] = api_base
-        res = completion(**kwargs)
+        res = completion(
+            model=self.model,
+            custom_llm_provider=self.provider,
+            messages=messages,
+            api_base=api_base,
+        )
         message = res.choices[0].message
         self.messages.append(message.model_dump())
         self.total_cost = res._hidden_params["response_cost"]
@@ -119,10 +121,15 @@ User Response:
 
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
         api_base = os.getenv("USER_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
-        kwargs = {"model": self.model, "custom_llm_provider": self.provider, "messages": messages}
-        if api_base:
-            kwargs["api_base"] = api_base
-        res = completion(**kwargs)
+        # kwargs = {"model": self.model, "custom_llm_provider": self.provider, "messages": messages}
+        # if api_base:
+        #     kwargs["api_base"] = api_base
+        res = completion(
+            model=self.model,
+            custom_llm_provider=self.provider,
+            messages=messages,
+            api_base=api_base,
+        )
         message = res.choices[0].message
         self.messages.append(message.model_dump())
         self.total_cost = res._hidden_params["response_cost"]
@@ -170,10 +177,12 @@ class VerifyUserSimulationEnv(LLMUserSimulationEnv):
         cur_message = None
         api_base = os.getenv("USER_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
         while attempts < self.max_attempts:
-            kwargs = {"model": self.model, "custom_llm_provider": self.provider, "messages": messages}
-            if api_base:
-                kwargs["api_base"] = api_base
-            res = completion(**kwargs)
+            res = completion(
+                model=self.model,
+                custom_llm_provider=self.provider,
+                messages=messages,
+                api_base=api_base,
+            )
             cur_message = res.choices[0].message
             self.total_cost = res._hidden_params["response_cost"]
             if verify(self.model, self.provider, cur_message, messages):
@@ -232,14 +241,12 @@ Your answer will be parsed, so do not include any other text than the classifica
 
 Classification:"""
     api_base = os.getenv("USER_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
-    kwargs = {
-        "model": model,
-        "custom_llm_provider": provider,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    if api_base:
-        kwargs["api_base"] = api_base
-    res = completion(**kwargs)
+    res = completion(
+        model=model,
+        custom_llm_provider=provider,
+        messages=[{"role": "user", "content": prompt}],
+        api_base=api_base,
+    )
     return "true" in res.choices[0].message.content.lower()
 
 
@@ -270,14 +277,12 @@ Reflection:
 Response:
 <the response (this will be parsed and sent to the agent)>"""
     api_base = os.getenv("USER_MODEL_API_BASE") or os.getenv("OPENAI_API_BASE")
-    kwargs = {
-        "model": model,
-        "custom_llm_provider": provider,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    if api_base:
-        kwargs["api_base"] = api_base
-    res = completion(**kwargs)
+    res = completion(
+        model=model,
+        custom_llm_provider=provider,
+        messages=[{"role": "user", "content": prompt}],
+        api_base=api_base,
+    )
     _, response = res.choices[0].message.content.split("Response:")
     return response.strip()
 
