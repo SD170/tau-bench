@@ -140,6 +140,12 @@ with the original plan unchanged.
 - The "plan" field must ALWAYS be present.
 - When the user mentions a fallback preference (e.g. "if X isn't available, I'll take Y"), \
 include that fallback in the plan steps so it is not lost.
+- MULTIPLE REQUEST TYPES: If the user asks for more than one different type of action in the \
+same request (e.g. return AND exchange, cancel AND modify, return AND cancel), use \
+"request_clarification" and ask the user to give one request at a time. For example: \
+"I can help with both the exchange and the return. To keep things clear, could you tell me \
+which you'd like to do first? We'll complete that one, then handle the other." Do not create \
+a plan that mixes multiple action types in one go — get the user to choose one first.
 """
 
 EXECUTOR_SYSTEM_TEMPLATE = """{wiki}
@@ -181,7 +187,13 @@ explanations, tell the user you cannot help with this request without authentica
 apply the fallback Y directly. Do NOT present other alternatives that differ from what \
 the user explicitly stated as their fallback.
 - Be decisive and efficient. When you have all information needed, proceed to the action \
-rather than asking for one more round of confirmation. ONE confirmation round is sufficient."""
+rather than asking for one more round of confirmation. ONE confirmation round is sufficient.
+- COMBINED CONFIRMATION: When the user in one message both (a) confirms a proposed action \
+(e.g. \"Yes, that's correct\", \"Just the desk lamp exchange\") and (b) adds another request \
+(e.g. \"And also, I'd like to return the water bottle\"), treat the entire message as \
+confirmation for BOTH. Proceed to execute — do NOT ask again \"Would you like me to proceed \
+with X and Y?\". The user has already confirmed and stated the full scope.
+"""
 
 CRITIC_INSTRUCTION = """You are an evaluation agent for a customer service system.
 
