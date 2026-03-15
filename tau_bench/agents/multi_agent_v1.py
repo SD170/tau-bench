@@ -29,6 +29,7 @@ class PlanStep:
     id: str
     description: str
     status: str  # pending | in_progress | done
+    is_verified: bool = False
 
 @dataclass
 class Plan:
@@ -39,7 +40,12 @@ class Plan:
         return {
             "goal": self.goal,
             "steps": [
-                {"id": s.id, "description": s.description, "status": s.status}
+                {
+                    "id": s.id,
+                    "description": s.description,
+                    "status": s.status,
+                    "is_verified": s.is_verified,
+                }
                 for s in self.steps
             ],
         }
@@ -53,6 +59,7 @@ class Plan:
                     id=s["id"],
                     description=s["description"],
                     status=s.get("status", "pending"),
+                    is_verified=s.get("is_verified", False),
                 )
                 for s in d.get("steps", [])
             ],
@@ -65,6 +72,7 @@ class ConversationState:
     approved_plan: Optional[Plan] = None
     pending_plan_update: Optional[Dict[str, Any]] = None
     active_step_id: Optional[str] = None
+    instruction_vault: str = ""
     total_cost: float = 0.0
     internal_trace: List[Dict[str, Any]] = field(default_factory=list)
     info: Dict[str, Any] = field(default_factory=dict)
@@ -75,7 +83,11 @@ class ConversationState:
 # Role prompts
 # ---------------------------------------------------------------------------
 
-PLANNER_INSTRUCTION = """You are a planning agent for a customer service system.
+PLANNER_INSTRUCTION = """<memory>
+{instruction_vault}
+</memory>
+
+You are a planning and intent-standardization agent for a customer service system.
 
 # Domain Policy
 {wiki}
@@ -93,16 +105,30 @@ PLANNER_INSTRUCTION = """You are a planning agent for a customer service system.
 {conversation}
 
 # Instructions
-Analyze the conversation and decide how to proceed with the plan.
+1. Standardize the user's intent into a formal canonical intent label.
+2. Infer the required structured fields for that intent (e.g., order_id, item_id).
+3. Design or update the plan so that, before any tools are used, there is a
+   "Requirement Document" step that explicitly lists and collects all required fields.
+4. Update step statuses (pending -> in_progress -> done) as appropriate.
 
 You MUST respond with ONLY valid JSON (no markdown, no extra text) in this exact format:
 {{
   "decision": "continue_existing_plan" | "propose_plan_change" | "request_clarification",
   "reason": "Brief explanation of your decision",
+  "intent_schema": {{
+    "detected_intent": "INTENT_EXCHANGE" | "INTENT_REFUND" | "INTENT_INFORMATION" | null,
+    "raw_utterance": "The latest user utterance in natural language",
+    "canonical_utterance": "Cleaned, canonical wording of the user's request",
+    "required_fields": ["order_id", "item_id"],
+    "mappings": [
+      {{"raw": "get a new one", "intent": "INTENT_EXCHANGE"}},
+      {{"raw": "refund me", "intent": "INTENT_REFUND"}}
+    ]
+  }},
   "plan": {{
     "goal": "The overall goal based on the user request",
     "steps": [
-      {{"id": "s1", "description": "Step description", "status": "pending"}}
+      {{"id": "s1", "description": "Requirement Document for INTENT_EXCHANGE: list and collect required fields: order_id, item_id.", "status": "pending"}}
     ]
   }},
   "active_step_id": "s1",
@@ -110,11 +136,14 @@ You MUST respond with ONLY valid JSON (no markdown, no extra text) in this exact
 }}
 
 Rules:
+- The "intent_schema" field is REQUIRED and must always be present.
+- If you cannot confidently determine the intent, set "detected_intent" to null and
+  leave "required_fields" as an empty list.
 - If there is no existing plan, create one and use "continue_existing_plan".
 - If the user's latest message materially changes the goal, constraints, or approach, \
 use "propose_plan_change" and set "confirmation_question" to ask for confirmation.
-- If you just need to progress through existing steps, use "continue_existing_plan" and \
-update step statuses accordingly.
+- The first step in any new plan for a concrete intent should normally be a \
+"Requirement Document" step that gathers all required fields.
 - Step status updates (pending -> in_progress -> done) do NOT require user confirmation.
 - If a pending plan update exists and the user confirmed it, apply the change and return \
 "continue_existing_plan" with the updated plan.
@@ -125,7 +154,11 @@ with the original plan unchanged.
 - The "plan" field must ALWAYS be present.
 """
 
-EXECUTOR_SYSTEM_TEMPLATE = """{wiki}
+EXECUTOR_SYSTEM_TEMPLATE = """<memory>
+{instruction_vault}
+</memory>
+
+{wiki}
 
 # Current Plan
 {plan_summary}
@@ -137,7 +170,10 @@ Execute the active step of the plan using the available tools. Follow the domain
 If you have enough information to respond to the user, respond directly.
 If you need to gather information or perform an action, use the appropriate tool."""
 
-CRITIC_INSTRUCTION = """You are an evaluation agent for a customer service system.
+CRITIC_INSTRUCTION = """You are the Policy-Sentinel Reviewer for a customer service system.
+
+Your ONLY job is to find reasons NOT to allow a proposed action. You should be conservative:
+if you are uncertain or see any potential violation, you must NOT approve the action.
 
 # Domain Policy
 {wiki}
@@ -152,22 +188,30 @@ CRITIC_INSTRUCTION = """You are an evaluation agent for a customer service syste
 Tool: {action_name}
 Arguments: {action_args}
 
-# Recent Conversation Context
+# Recent Conversation & Database State
+The recent conversation may include tool outputs that reflect the current database state.
+Treat these tool outputs as the ground-truth current state of the world.
 {recent_context}
 
-# Instructions
-Evaluate whether the proposed action is appropriate. Consider:
-1. Does the action align with the current plan step?
-2. Does the action follow the domain policy?
-3. Is the action safe and correct (right arguments, right tool)?
-4. If this is a response to the user, is it accurate and complete?
+# Reviewer Instructions (Policy-Sentinel)
+Act as a strict Reviewer whose role is to block unsafe, non-compliant, or premature actions:
+1. Compare the proposed action against the Domain Policy. Look for any policy violations,
+   missing prerequisites, or unsafe arguments.
+2. Compare the proposed action against the current database state as revealed in recent
+   tool outputs. Check that identifiers, statuses, and entities referenced by the action
+   are valid and consistent with that state.
+3. Verify that the action is appropriate for the current plan step and does not skip any
+   required “Requirement Document” or data-gathering steps.
+4. For user-facing responses, ensure they are accurate, complete, and do not fabricate
+   data that has not been observed.
+5. Always err on the side of rejection: if there is any doubt, set approved to false.
 
 You MUST respond with ONLY valid JSON (no markdown, no extra text):
 {{
-  "approved": true,
-  "reason": "Why you approved or rejected",
-  "feedback_for_executor": null,
-  "risk_level": "low"
+  "approved": false,
+  "reason": "Detailed explanation of why the action should be blocked or, if truly safe, why it can be allowed",
+  "feedback_for_executor": "Concrete Interpreter Feedback that can trigger an Aha Moment and guide the Executor to self-correct.",
+  "risk_level": "low" | "medium" | "high"
 }}
 """
 
@@ -282,6 +326,133 @@ class MultiAgentV1(Agent):
                 lines.append(f"[User] {(msg.get('content') or '')[:300]}")
         return "\n".join(lines) if lines else "No conversation yet."
 
+    @staticmethod
+    def _get_latest_user_message(state: ConversationState) -> Optional[str]:
+        for msg in reversed(state.executor_messages):
+            if msg.get("role") == "user":
+                content = msg.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content
+        return None
+
+    @staticmethod
+    def _check_discrepancies(state: ConversationState) -> Optional[str]:
+        """
+        FACT Agent-style check: compare the latest user message against the
+        instruction_vault to detect unexplained contradictions (e.g., changing
+        the number of items without explanation).
+
+        Returns a Mandatory Clarification question string if a discrepancy is
+        detected; otherwise returns None.
+        """
+        vault = state.instruction_vault or ""
+        latest_user = MultiAgentV1._get_latest_user_message(state) or ""
+        if not vault or not latest_user:
+            return None
+
+        # Simple heuristic: detect mismatched numeric quantities without
+        # obvious "change/explanation" language in the latest user message.
+        vault_nums = re.findall(r"\d+", vault)
+        user_nums = re.findall(r"\d+", latest_user)
+        if not vault_nums or not user_nums:
+            return None
+
+        if set(vault_nums) == set(user_nums):
+            return None
+
+        explanation_markers = [
+            "change",
+            "changed",
+            "update",
+            "updated",
+            "instead",
+            "different",
+            "correction",
+            "correct",
+            "actually",
+            "now",
+            "revision",
+            "revised",
+            "modify",
+            "modified",
+            "adjust",
+            "adjusted",
+        ]
+        lower_msg = latest_user.lower()
+        if any(marker in lower_msg for marker in explanation_markers):
+            return None
+
+        return (
+            "Mandatory Clarification: your latest message appears to contradict your "
+            "original instructions (for example, the number of items or quantities "
+            "has changed without explanation). Before I call any tools or change the "
+            "system state, could you clarify which version is correct and why it "
+            "changed?"
+        )
+
+    @staticmethod
+    def _all_milestones_verified(plan: Optional[Plan]) -> bool:
+        """
+        Cognitive planning-style check: ensure that all milestones (plan steps) have
+        been explicitly marked as verified before allowing the conversation to truly
+        terminate.
+
+        If there is no plan or no steps, this returns True.
+        """
+        if plan is None or not plan.steps:
+            return True
+        return all(step.is_verified for step in plan.steps)
+
+    @staticmethod
+    def _inject_requirement_doc_step(
+        plan_data: Dict[str, Any], intent_schema: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Ensure that the plan contains a 'Requirement Document' step when a specific intent
+        has been identified. This step should explicitly list the required fields inferred
+        from the intent_schema before any tools are used.
+        """
+        detected_intent = intent_schema.get("detected_intent")
+        if not detected_intent:
+            return plan_data
+
+        required_fields: List[str] = intent_schema.get("required_fields") or []
+        steps: List[Dict[str, Any]] = plan_data.get("steps") or []
+
+        # Check if a requirement document step already exists
+        for step in steps:
+            desc = (step.get("description") or "").lower()
+            if "requirement document" in desc:
+                return plan_data
+
+        # Generate a non-colliding step id
+        existing_ids = {str(s.get("id", "")) for s in steps}
+        base_id = "req_1"
+        if base_id not in existing_ids:
+            new_id = base_id
+        else:
+            i = 2
+            while f"req_{i}" in existing_ids:
+                i += 1
+            new_id = f"req_{i}"
+
+        if required_fields:
+            fields_str = ", ".join(required_fields)
+            desc = (
+                f"Requirement Document for {detected_intent}: list and collect "
+                f"required fields: {fields_str}."
+            )
+        else:
+            desc = (
+                f"Requirement Document for {detected_intent}: identify and collect all "
+                f"required structured fields for this intent (e.g., order_id, item_id)."
+            )
+
+        new_step = {"id": new_id, "description": desc, "status": "pending"}
+        plan_data = dict(plan_data)
+        plan_data["steps"] = [new_step] + steps
+        return plan_data
+
     # ---- LLM role callers ----
 
     def _call_planner(self, state: ConversationState) -> Dict[str, Any]:
@@ -291,6 +462,7 @@ class MultiAgentV1(Agent):
             else "None"
         )
         prompt = PLANNER_INSTRUCTION.format(
+            instruction_vault=state.instruction_vault,
             wiki=self.wiki,
             tools=self._tools_str,
             current_plan=self._format_plan(state.approved_plan),
@@ -325,6 +497,13 @@ class MultiAgentV1(Agent):
             return {
                 "decision": "continue_existing_plan",
                 "reason": "Failed to parse planner output, continuing.",
+                "intent_schema": {
+                    "detected_intent": None,
+                    "raw_utterance": "",
+                    "canonical_utterance": "",
+                    "required_fields": [],
+                    "mappings": [],
+                },
                 "plan": (
                     state.approved_plan.to_dict()
                     if state.approved_plan
@@ -333,6 +512,14 @@ class MultiAgentV1(Agent):
                 "active_step_id": state.active_step_id,
                 "confirmation_question": None,
             }
+
+        # Post-process the plan using the intent_schema to ensure a Requirement Document step.
+        intent_schema = parsed.get("intent_schema") or {}
+        plan_data = parsed.get("plan") or {}
+        if isinstance(plan_data, dict):
+            plan_data = self._inject_requirement_doc_step(plan_data, intent_schema)
+            parsed["plan"] = plan_data
+
         return parsed
 
     def _call_executor(
@@ -341,6 +528,7 @@ class MultiAgentV1(Agent):
         extra_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[Dict[str, Any], Action, float]:
         system_prompt = EXECUTOR_SYSTEM_TEMPLATE.format(
+            instruction_vault=state.instruction_vault,
             wiki=self.wiki,
             plan_summary=self._format_plan(state.approved_plan),
             active_step=self._get_active_step_description(
@@ -417,9 +605,14 @@ class MultiAgentV1(Agent):
         )
         if parsed is None:
             return {
-                "approved": True,
-                "reason": "Critic output unparseable, approving by default.",
-                "feedback_for_executor": None,
+                "approved": False,
+                "reason": "Policy-Sentinel output unparseable; conservatively blocking the action.",
+                "feedback_for_executor": (
+                    "Interpreter Feedback: I could not reliably verify your proposed action "
+                    "against the domain policy and current database state. Please re-check "
+                    "your assumptions, required fields, and any referenced entities before "
+                    "trying a different approach."
+                ),
                 "risk_level": "medium",
             }
         return parsed
@@ -427,11 +620,15 @@ class MultiAgentV1(Agent):
     # ---- Heuristic gate ----
 
     @staticmethod
+    def _is_read_only_tool(action_name: str) -> bool:
+        name_lower = action_name.lower()
+        return any(name_lower.startswith(p) for p in READ_ONLY_PREFIXES)
+
+    @staticmethod
     def _requires_critique(action: Action) -> bool:
         if action.name == RESPOND_ACTION_NAME:
             return True
-        name_lower = action.name.lower()
-        return not any(name_lower.startswith(p) for p in READ_ONLY_PREFIXES)
+        return not MultiAgentV1._is_read_only_tool(action.name)
 
     @staticmethod
     def _message_to_action(message: Dict[str, Any]) -> Action:
@@ -450,6 +647,21 @@ class MultiAgentV1(Agent):
             kwargs={RESPOND_ACTION_FIELD_NAME: message.get("content", "")},
         )
 
+    # ---- Outcome-Driven Validation helpers ----
+
+    def _select_audit_tool(self, write_tool_name: str) -> Optional[str]:
+        """
+        Pick a read-only tool to use for Environment Audit after a write action.
+        For now, we simply choose the first tool whose name matches the
+        READ_ONLY_PREFIXES heuristic.
+        """
+        for t in self.tools_info:
+            fn = t.get("function", {})
+            name = fn.get("name")
+            if isinstance(name, str) and self._is_read_only_tool(name):
+                return name
+        return None
+
     # ---- Orchestrated solve loop ----
 
     def solve(
@@ -460,6 +672,7 @@ class MultiAgentV1(Agent):
     ) -> SolveResult:
         reset_resp = env.reset(task_index=task_index)
         state = ConversationState()
+        state.instruction_vault = reset_resp.observation
         state.info = (
             reset_resp.info.model_dump()
             if hasattr(reset_resp.info, "model_dump")
@@ -539,11 +752,37 @@ class MultiAgentV1(Agent):
                     "active_step_id", state.active_step_id
                 )
 
+            # ---------- FACT Agent discrepancy gate ----------
+            # Before allowing any tool calls, check for contradictions between the latest
+            # user message and the instruction_vault. If found, force a Mandatory
+            # Clarification question and skip the executor/tool phase for this turn.
+            mandatory_clarification = self._check_discrepancies(state)
+            if mandatory_clarification:
+                env_resp = env.step(
+                    Action(
+                        name=RESPOND_ACTION_NAME,
+                        kwargs={RESPOND_ACTION_FIELD_NAME: mandatory_clarification},
+                    )
+                )
+                state.reward = env_resp.reward
+                state.info = {**state.info, **env_resp.info.model_dump()}
+                state.executor_messages.extend(
+                    [
+                        {"role": "assistant", "content": mandatory_clarification},
+                        {"role": "user", "content": env_resp.observation},
+                    ]
+                )
+                last_source = "user"
+                if env_resp.done:
+                    break
+                continue
+
             # ---------- EXECUTOR + CRITIC PHASE ----------
             action: Optional[Action] = None
             executor_msg: Optional[Dict[str, Any]] = None
             retry_context: List[Dict[str, Any]] = []
 
+            last_critic_result: Optional[Dict[str, Any]] = None
             for attempt in range(self.max_critic_retries + 1):
                 executor_msg, action, cost = self._call_executor(
                     state, extra_messages=retry_context or None
@@ -552,18 +791,21 @@ class MultiAgentV1(Agent):
 
                 if self._requires_critique(action):
                     critic_result = self._call_critic(state, action)
-                    if critic_result.get("approved", True):
+                    last_critic_result = critic_result
+                    if critic_result.get("approved", False):
                         break
                     feedback = critic_result.get(
                         "feedback_for_executor",
-                        "Please reconsider your action.",
+                        "Interpreter Feedback: Your proposed action appears to conflict with the domain policy or current database state.",
                     )
                     retry_context.append(
                         {
                             "role": "user",
                             "content": (
-                                f"[Evaluator] Your proposed action was rejected: "
-                                f"{feedback}. Please try a different approach."
+                                "[Interpreter Feedback] Policy-Sentinel Reviewer has blocked "
+                                "your previous action. Use this feedback to trigger an Aha Moment "
+                                "and self-correct your plan:\n"
+                                f"{feedback}"
                             ),
                         }
                     )
@@ -613,6 +855,41 @@ class MultiAgentV1(Agent):
                             "content": f"API output: {env_resp.observation}",
                         }
                     )
+
+                # Outcome-Driven Validation (ReTool): if this was a write tool
+                # (i.e., not read-only), immediately perform an Environment Audit
+                # via a read tool to verify the effect on the database.
+                if not self._is_read_only_tool(action.name):
+                    audit_tool_name = self._select_audit_tool(action.name)
+                    if audit_tool_name is not None:
+                        audit_action = Action(
+                            name=audit_tool_name,
+                            kwargs=action.kwargs,
+                        )
+                        audit_resp = env.step(audit_action)
+                        # Do not override main reward/info; this is an auxiliary check.
+                        state.executor_messages.extend(
+                            [
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": f"audit_{audit_tool_name}",
+                                    "name": audit_tool_name,
+                                    "content": audit_resp.observation,
+                                },
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "[System Feedback] Environment Audit after your "
+                                        "last write action returned:\n"
+                                        f"{audit_resp.observation}\n"
+                                        "Compare this audited state with what you claimed "
+                                        "to have done. If they differ, treat this as an "
+                                        "Aha Moment and self-correct your plan or actions."
+                                    ),
+                                },
+                            ]
+                        )
+
                 last_source = "tool"
             else:
                 content = action.kwargs.get(RESPOND_ACTION_FIELD_NAME, "")
@@ -624,15 +901,28 @@ class MultiAgentV1(Agent):
                 )
                 last_source = "user"
 
-                # Mark active step done after responding to user
+                # Mark active step done after responding to user and record verification
                 if state.approved_plan and state.active_step_id:
                     for s in state.approved_plan.steps:
                         if s.id == state.active_step_id and s.status == "in_progress":
                             s.status = "done"
+                            # Milestone-based KPI tracking: mark as verified only if the
+                            # Policy-Sentinel approved the final response for this step.
+                            if last_critic_result is not None:
+                                s.is_verified = bool(
+                                    last_critic_result.get("approved", False)
+                                )
                             break
 
             if env_resp.done:
-                break
+                # Cognitive planning / Plangen-style guard: do not allow the agent to
+                # truly terminate the conversation until all milestones are verified.
+                if self._all_milestones_verified(state.approved_plan):
+                    break
+                # Force a re-plan on the next iteration by treating this as coming from
+                # the user again; the planner will see that not all milestones are
+                # verified and can adjust the plan accordingly.
+                last_source = "user"
 
         return SolveResult(
             reward=state.reward,
